@@ -396,3 +396,302 @@ def test_concurrent_idempotent_creates_single_session(client):
     session_ids = {o[0] for o in outcomes}
     assert len(session_ids) == 1
     assert sum(1 for o in outcomes if o[1]) == 1  # exactly one created_now
+
+
+# --------------------------------------------------------------------------
+# Rotation
+# --------------------------------------------------------------------------
+
+
+def rotate(client, sid, shares, t=2, n=4, **extra):
+    body = {"shares": shares, "threshold": t, "total": n}
+    body.update(extra)
+    return client.post(f"/api/v1/sessions/{sid}/rotate", json=body)
+
+
+def _session_count(client):
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["DR_DB_PATH"])
+    try:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_rotate_success_flow(client):
+    data = create(client, secret="rotate-me-🔐", t=3, n=5)
+    sid = data["session_id"]
+    r = rotate(client, sid, data["shares"][:3], t=2, n=4)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["rotated_from"] == sid
+    assert body["old_session_status"] == "rotated"
+    assert body["status"] == "active"
+    assert body["threshold"] == 2 and body["total_shares"] == 4
+    assert body["shares_returned"] is True and body["replay"] is False
+    assert len(body["shares"]) == 4
+    assert len(body["share_checksums"]) == 4
+
+    from app.sharing import decode_share
+
+    new_sid = body["session_id"]
+    assert new_sid != sid
+    for token in body["shares"]:
+        token_sid, _, _ = decode_share(token)
+        assert token_sid == new_sid
+
+    # Old session is rotated and points at its replacement.
+    old = client.get(f"/api/v1/sessions/{sid}").json()
+    assert old["status"] == "rotated"
+    assert old["replacement_session_id"] == new_sid
+    assert old["rotated_at"] is not None
+
+    # New session points back and recovers the same key under the new scheme.
+    new = client.get(f"/api/v1/sessions/{new_sid}").json()
+    assert new["status"] == "active"
+    assert new["replaced_session_id"] == sid
+    rec = client.post(
+        f"/api/v1/sessions/{new_sid}/shares",
+        json={"shares": body["shares"][:2]},
+    ).json()
+    assert rec["recovered"] is True
+    assert rec["key"] == "rotate-me-🔐"
+
+
+def test_rotated_session_rejects_recovery(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    new_sid = rotate(client, sid, data["shares"][:2]).json()["session_id"]
+    r = client.post(
+        f"/api/v1/sessions/{sid}/shares", json={"shares": data["shares"][:2]}
+    )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["code"] == "session_rotated"
+    assert body["error"]["details"]["replacement_session_id"] == new_sid
+
+
+def test_rotate_requires_old_threshold(client):
+    data = create(client, t=3, n=5)
+    sid = data["session_id"]
+    r = rotate(client, sid, data["shares"][:2], t=2, n=4)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "insufficient_shares"
+    # Failure leaves the old session untouched and creates nothing.
+    old = client.get(f"/api/v1/sessions/{sid}").json()
+    assert old["status"] == "active"
+    assert old["replacement_session_id"] is None
+    assert old["rotated_at"] is None
+    assert _session_count(client) == 1
+
+
+def test_rotate_rejects_tampered_share(client):
+    data = create(client, secret="S3cr3t", t=2, n=3)
+    sid = data["session_id"]
+    from app.sharing import decode_share, encode_share
+
+    s_sid, x, y = decode_share(data["shares"][0])
+    tampered = encode_share(s_sid, x, bytes([y[0] ^ 0xFF]) + y[1:])
+    r = rotate(client, sid, [tampered, data["shares"][1]])
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "integrity_check_failed"
+    # Old session unchanged, no replacement left behind.
+    old = client.get(f"/api/v1/sessions/{sid}").json()
+    assert old["status"] == "active"
+    assert _session_count(client) == 1
+
+
+def test_rotate_idempotent_replay_returns_metadata_only(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    body = {
+        "shares": data["shares"][:2],
+        "threshold": 3,
+        "total": 4,
+        "idempotency_key": "rot-key-1",
+    }
+    r1 = client.post(f"/api/v1/sessions/{sid}/rotate", json=body)
+    r2 = client.post(f"/api/v1/sessions/{sid}/rotate", json=body)
+    assert r1.status_code == 201 and r2.status_code == 201
+    first, second = r1.json(), r2.json()
+    assert first["shares"] is not None
+    assert second["session_id"] == first["session_id"]
+    assert second["shares"] is None
+    assert second["shares_returned"] is False
+    assert second["replay"] is True
+    assert second["rotated_from"] == sid
+    assert _session_count(client) == 2
+
+
+def test_rotate_idempotency_key_via_header(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    body = {"shares": data["shares"][:2], "threshold": 2, "total": 4}
+    headers = {"Idempotency-Key": "rot-hdr-1"}
+    r1 = client.post(f"/api/v1/sessions/{sid}/rotate", json=body, headers=headers)
+    r2 = client.post(f"/api/v1/sessions/{sid}/rotate", json=body, headers=headers)
+    assert r1.json()["session_id"] == r2.json()["session_id"]
+    assert r2.json()["shares"] is None
+    assert r2.json()["replay"] is True
+
+
+def test_rotate_idempotency_conflict_on_different_request(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    base = {
+        "shares": data["shares"][:2],
+        "threshold": 2,
+        "total": 4,
+        "idempotency_key": "rot-key-2",
+    }
+    r1 = client.post(f"/api/v1/sessions/{sid}/rotate", json=base)
+    assert r1.status_code == 201
+    r2 = client.post(f"/api/v1/sessions/{sid}/rotate", json={**base, "total": 5})
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "idempotency_conflict"
+
+
+def test_rotate_twice_rejected(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    r1 = rotate(client, sid, data["shares"][:2])
+    assert r1.status_code == 201
+    new_sid = r1.json()["session_id"]
+    r2 = rotate(client, sid, data["shares"][:2])
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "session_rotated"
+    assert r2.json()["error"]["details"]["replacement_session_id"] == new_sid
+
+
+def test_rotate_revoked_session_rejected(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    client.post(f"/api/v1/sessions/{sid}/revoke")
+    r = rotate(client, sid, data["shares"][:2])
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "session_revoked"
+
+
+def test_rotate_recovered_session_rejected(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    client.post(
+        f"/api/v1/sessions/{sid}/shares", json={"shares": data["shares"][:2]}
+    )
+    r = rotate(client, sid, data["shares"][:2])
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "session_not_rotatable"
+
+
+def test_rotate_not_found(client):
+    assert rotate(client, "deadbeef", ["whatever"]).status_code == 404
+
+
+def test_rotate_parameter_validation(client):
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    assert rotate(client, sid, data["shares"][:2], t=4, n=2).status_code == 422
+    r = client.post(
+        f"/api/v1/sessions/{sid}/rotate",
+        json={"shares": data["shares"][:2], "threshold": 1, "total": 2},
+    )
+    assert r.status_code == 422
+
+
+def test_concurrent_idempotent_rotation_single_winner(client):
+    """Parallel rotations sharing one idempotency key rotate exactly once."""
+    import threading
+    import uuid
+
+    from app.database import sha256_hex
+
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    database = client.app.state.db
+    key = "rot-race-" + uuid.uuid4().hex
+    request_hash = sha256_hex(b"rotate-req")
+    outcomes = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        new_sid = uuid.uuid4().hex
+        barrier.wait()
+        try:
+            outcomes.append(
+                database.rotate_session(
+                    sid,
+                    new_sid,
+                    threshold=2,
+                    total_shares=4,
+                    key_digest="d",
+                    key_encoding="utf-8",
+                    key_length=1,
+                    share_checksums={1: "a", 2: "b", 3: "c", 4: "d"},
+                    idempotency_key=key,
+                    request_hash=request_hash,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - failure path
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not any(isinstance(o, Exception) for o in outcomes), outcomes
+    new_ids = {o[0] for o in outcomes}
+    assert len(new_ids) == 1
+    assert sum(1 for o in outcomes if o[1]) == 1  # exactly one created_now
+    row = database.get_session(sid)
+    assert row["status"] == "rotated"
+    assert row["replacement_session_id"] == new_ids.pop()
+    assert _session_count(client) == 2
+
+
+def test_rotation_losing_race_leaves_no_partial_state(client):
+    """A rotation that finds the session already rotated aborts atomically."""
+    import uuid
+
+    import pytest as _pytest
+
+    from app.database import RotationStateError
+
+    data = create(client, t=2, n=3)
+    sid = data["session_id"]
+    database = client.app.state.db
+    first_new = uuid.uuid4().hex
+    result = database.rotate_session(
+        sid,
+        first_new,
+        threshold=2,
+        total_shares=4,
+        key_digest="d",
+        key_encoding="utf-8",
+        key_length=1,
+        share_checksums={1: "a", 2: "b", 3: "c", 4: "d"},
+        idempotency_key=None,
+        request_hash="h1",
+    )
+    assert result == (first_new, True)
+
+    with _pytest.raises(RotationStateError):
+        database.rotate_session(
+            sid,
+            uuid.uuid4().hex,
+            threshold=2,
+            total_shares=4,
+            key_digest="d",
+            key_encoding="utf-8",
+            key_length=1,
+            share_checksums={1: "a", 2: "b", 3: "c", 4: "d"},
+            idempotency_key=None,
+            request_hash="h2",
+        )
+
+    row = database.get_session(sid)
+    assert row["status"] == "rotated"
+    assert row["replacement_session_id"] == first_new
+    assert _session_count(client) == 2  # loser left no session behind

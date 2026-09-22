@@ -19,6 +19,7 @@
 | 重建结果复核 | 重建后的密钥再与存储摘要做常量时间比对，不一致绝不返回 |
 | 密钥只展示一次 | 恢复成功后密钥仅在当次响应出现；重复提交返回 `replay: true` 且 `key: null` |
 | 会话可撤销 | 撤销后任何提交分片请求被拒绝（409）；撤销操作本身幂等 |
+| 会话可轮换 | 提交达到旧阈值且校验通过的分片即可把密钥轮换到新的 (t, n) 方案：同一事务内创建新会话（分片只返回一次）并把旧会话标记为 `rotated`，此后旧会话拒绝一切恢复；失败则旧会话状态不变、不留新会话 |
 | 操作幂等 | 创建会话支持 `Idempotency-Key`（请求头或请求体）；同键同参数重放返回同一会话且不再返回分片；同键不同参数返回 409 |
 | 可选 API Key | 设置 `DR_API_KEY` 后，`/api/v1/*` 需携带 `X-API-Key`（默认关闭，开箱即用） |
 
@@ -35,7 +36,7 @@
 │   ├── sharing.py     # Shamir 拆分/重建、分片令牌编解码
 │   ├── gf256.py       # GF(2^8) 有限域运算（AES 多项式 0x11b）
 │   └── database.py    # SQLite 建表与事务
-├── tests/             # pytest：50+ 用例（域运算/拆分/API 全流程/安全场景）
+├── tests/             # pytest：70+ 用例（域运算/拆分/API 全流程/轮换/安全场景）
 ├── entrypoint.sh      # 启动前初始化数据库，然后起 uvicorn
 ├── Dockerfile
 ├── docker-compose.yml
@@ -74,6 +75,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/sessions` | 创建恢复会话，一次性返回 n 个分片 |
 | GET  | `/api/v1/sessions/{id}` | 查询会话状态与已提交分片索引 |
 | POST | `/api/v1/sessions/{id}/shares` | 校验分片并在达到阈值时重建密钥 |
+| POST | `/api/v1/sessions/{id}/rotate` | 用旧阈值分片把密钥轮换到新的 (t, n) 方案 |
 | POST | `/api/v1/sessions/{id}/revoke` | 撤销会话（幂等） |
 
 所有错误响应统一为：
@@ -164,8 +166,9 @@ curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/shares \
 curl http://localhost:8000/api/v1/sessions/a1b2…
 ```
 
-返回 `active` / `recovered` / `revoked`、阈值、密钥摘要、已验证分片索引、
-失败尝试计数与各时间戳。
+返回 `active` / `recovered` / `revoked` / `rotated`、阈值、密钥摘要、已验证分片索引、
+失败尝试计数与各时间戳。已轮换的会话额外返回 `replacement_session_id`（指向新会话），
+新会话则带有 `replaced_session_id`（指向被替换的旧会话）；未轮换时两者为 `null`。
 
 ### 4. 撤销会话（幂等）
 
@@ -177,14 +180,61 @@ curl -X POST http://localhost:8000/api/v1/sessions/a1b2…/revoke
 撤销后提交分片返回 409 `session_revoked`。已恢复的会话不可撤销，调用返回
 409 `session_not_revocable`。
 
+### 5. 轮换会话（更换阈值方案）
+
+当分片持有方变动或安全策略调整（如从 3/5 改为 2/4）时，无需先恢复密钥再重新
+创建：提交**达到旧阈值且完整性校验通过**的分片，并指定新的 `threshold`/`total`，
+服务在**同一事务**中完成：用旧分片重建密钥 → 按新参数重新分片 → 创建新会话
+（新分片仅当次返回一次）→ 把旧会话标记为 `rotated`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/sessions/a1b2…/rotate \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: rotate-2026-09-22-001' \
+  -d '{
+        "shares": ["旧令牌1", "旧令牌2", "旧令牌3"],
+        "threshold": 2,
+        "total": 4
+      }'
+```
+
+成功响应（201，新分片只出现这一次）：
+
+```json
+{
+  "rotated_from": "a1b2…",
+  "old_session_status": "rotated",
+  "session_id": "c3d4…",
+  "status": "active",
+  "threshold": 2,
+  "total_shares": 4,
+  "shares": ["新令牌1", "…"],
+  "share_checksums": [{"index": 1, "digest": "sha256-hex…"}],
+  "shares_returned": true,
+  "replay": false
+}
+```
+
+- 轮换成功后，旧会话的任何恢复/再次轮换请求一律返回 409 `session_rotated`
+  （响应 `details` 中附带 `replacement_session_id`）；新会话按新阈值正常恢复同一密钥。
+- 任一分片未通过完整性校验（400 `integrity_check_failed`）或有效分片不足旧阈值
+  （400 `insufficient_shares`）时整体失败：**旧会话保持 `active`，也不会留下新会话**。
+- 已撤销（409 `session_revoked`）或已恢复（409 `session_not_rotatable`）的会话不可轮换。
+- 幂等：携带相同 `Idempotency-Key`（请求头或请求体 `idempotency_key`）与相同请求体
+  重放，仅返回新会话元数据（`shares: null, replay: true`），不会再次暴露分片；
+  同一 key 搭配不同请求返回 409 `idempotency_conflict`。
+
 ## 幂等性说明
 
 - **创建**：携带相同 `Idempotency-Key` 的重试返回同一个 `session_id`；首次响应
   才有分片，重放响应 `shares: null, replay: true`。同一 key 搭配不同的密钥/阈值
   参数返回 409 `idempotency_conflict`。
+- **轮换**：与创建同一套机制——同键同请求重放只返回新会话元数据，不再暴露新分片；
+  同键不同请求返回 409。轮换在单事务内提交，并发重试不会产生重复会话或中间态。
 - **撤销**：重复撤销是无害的 no-op。
 - **提交**：同一请求内重复索引被标记拒绝；恢复完成后重复提交不再次返回密钥。
-- **服务重启**：表结构创建使用 `CREATE TABLE IF NOT EXISTS`，启动初始化可重复执行。
+- **服务重启**：表结构创建使用 `CREATE TABLE IF NOT EXISTS`，新增列通过启动时的
+  `ALTER TABLE` 就地迁移，初始化可重复执行，旧数据卷直接升级。
 
 ## 密码学实现说明
 
@@ -211,7 +261,8 @@ python -m pytest -q
 
 测试覆盖：域运算恒等式、20 组随机拆分/任意阈值子集恢复、低于阈值无法恢复、
 篡改/伪造/跨会话分片拒绝、恢复密钥只返回一次、撤销、创建与提交幂等、
-数据库不含密钥与原始分片等 50+ 断言。
+轮换全流程（成功/不足阈值/篡改分片/幂等重放/并发单胜者/失败不留痕）、
+数据库不含密钥与原始分片等 70+ 断言。
 
 ## 部署注意事项
 

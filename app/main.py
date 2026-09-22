@@ -17,7 +17,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field
 
 from . import sharing
-from .database import Database, IdempotencyConflict, row_to_dict, share_digest
+from .database import (
+    Database,
+    IdempotencyConflict,
+    RotationStateError,
+    row_to_dict,
+    share_digest,
+)
 
 DB_PATH = os.environ.get("DR_DB_PATH", os.path.join("data", "sss.db"))
 # When set, every /api/v1 call must present it in the X-API-Key header.
@@ -66,6 +72,49 @@ def error(code: str, message: str, http_status: int, details=None) -> HTTPExcept
     )
 
 
+def verify_share_tokens(
+    database: Database, session_id: str, row, tokens: list[str]
+) -> tuple[dict[int, bytes], list[dict]]:
+    """Integrity-check every submitted share token against stored digests.
+
+    Returns ``(valid, rejected)``: ``valid`` maps share index -> share bytes
+    (only fully authenticated shares), ``rejected`` lists ``{"index", "code"}``
+    entries. A rejected share never participates in interpolation, so it
+    cannot influence (or leak) the recovered key.
+    """
+    valid: dict[int, bytes] = {}
+    rejected: list[dict] = []
+    seen: set[int] = set()
+    for token in tokens:
+        if not isinstance(token, str) or len(token) > 8192:
+            rejected.append({"index": 0, "code": "malformed_share"})
+            continue
+        try:
+            token_session, x, y = sharing.decode_share(token)
+        except ValueError:
+            rejected.append({"index": 0, "code": "malformed_share"})
+            continue
+        if not hmac.compare_digest(token_session, session_id):
+            # Do not reveal which session the share belongs to.
+            rejected.append({"index": x, "code": "integrity_check_failed"})
+            continue
+        if x in seen:
+            rejected.append({"index": x, "code": "duplicate_index_in_request"})
+            continue
+        seen.add(x)
+
+        digest = database.get_share_digest(session_id, x)
+        actual = share_digest(session_id, x, y)
+        if len(y) != row["key_length"]:
+            rejected.append({"index": x, "code": "integrity_check_failed"})
+            continue
+        if digest is None or not hmac.compare_digest(digest, actual):
+            rejected.append({"index": x, "code": "integrity_check_failed"})
+            continue
+        valid[x] = y
+    return valid, rejected
+
+
 # --------------------------------------------------------------------------
 # Schemas
 # --------------------------------------------------------------------------
@@ -80,6 +129,16 @@ class CreateSessionRequest(BaseModel):
 
 class SubmitSharesRequest(BaseModel):
     shares: list[str] = Field(..., min_length=1, max_length=255)
+
+
+class RotateSessionRequest(BaseModel):
+    shares: list[str] = Field(
+        ..., min_length=1, max_length=255,
+        description="Verified shares of the CURRENT session, >= old threshold",
+    )
+    new_threshold: int = Field(..., ge=2, le=255)
+    new_total: int = Field(..., ge=2, le=255)
+    idempotency_key: str | None = Field(None, min_length=1, max_length=200)
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +325,8 @@ def get_session(session_id: str, database: Database = Depends(db)):
         "created_at": data["created_at"],
         "recovered_at": data["recovered_at"],
         "revoked_at": data["revoked_at"],
+        "rotated_at": data["rotated_at"],
+        "replacement_session_id": data["replacement_session_id"],
     }
 
 
@@ -289,6 +350,14 @@ def submit_shares(
         raise error("session_not_found", "recovery session does not exist", 404)
     if row["status"] == "revoked":
         raise error("session_revoked", "session has been revoked", 409)
+    if row["status"] == "rotated":
+        raise error(
+            "session_rotated",
+            "session has been rotated; recovery is permanently disabled, "
+            "use the replacement session",
+            409,
+            details={"replacement_session_id": row["replacement_session_id"]},
+        )
     if row["status"] == "recovered":
         return {
             "session_id": session_id,
@@ -302,37 +371,7 @@ def submit_shares(
         }
 
     threshold = row["threshold"]
-    valid: dict[int, bytes] = {}
-    rejected: list[dict[str, str | int]] = []
-
-    seen: set[int] = set()
-    for token in payload.shares:
-        if not isinstance(token, str) or len(token) > 8192:
-            rejected.append({"index": 0, "code": "malformed_share"})
-            continue
-        try:
-            token_session, x, y = sharing.decode_share(token)
-        except ValueError:
-            rejected.append({"index": 0, "code": "malformed_share"})
-            continue
-        if not hmac.compare_digest(token_session, session_id):
-            # Do not reveal which session the share belongs to.
-            rejected.append({"index": x, "code": "integrity_check_failed"})
-            continue
-        if x in seen:
-            rejected.append({"index": x, "code": "duplicate_index_in_request"})
-            continue
-        seen.add(x)
-
-        digest = database.get_share_digest(session_id, x)
-        actual = share_digest(session_id, x, y)
-        if len(y) != row["key_length"]:
-            rejected.append({"index": x, "code": "integrity_check_failed"})
-            continue
-        if digest is None or not hmac.compare_digest(digest, actual):
-            rejected.append({"index": x, "code": "integrity_check_failed"})
-            continue
-        valid[x] = y
+    valid, rejected = verify_share_tokens(database, session_id, row, payload.shares)
 
     if rejected:
         database.bump_attempt(session_id)
@@ -413,12 +452,203 @@ def revoke_session(session_id: str, database: Database = Depends(db)):
             "a recovered session cannot be revoked",
             409,
         )
+    if row["status"] == "rotated":
+        raise error(
+            "session_not_revocable",
+            "a rotated session is already terminal and cannot be revoked",
+            409,
+        )
     changed = database.revoke_session(session_id)
     row = database.get_session(session_id)
     return {
         "session_id": session_id,
         "status": row["status"],
-        "revoked": True,
+        "revoked": row["status"] == "revoked",
         "revoked_at": row["revoked_at"],
         "replay": not changed,
+    }
+
+
+def _rotation_replay_response(old_session_id: str, new_row) -> dict:
+    """Metadata-only answer for an idempotent rotation replay (no shares)."""
+    return {
+        "old_session_id": old_session_id,
+        "old_status": "rotated",
+        "session_id": new_row["id"],
+        "status": new_row["status"],
+        "threshold": new_row["threshold"],
+        "total_shares": new_row["total_shares"],
+        "shares": None,
+        "shares_returned": False,
+        "replay": True,
+        "message": "rotation already performed; the new shares were returned "
+        "once in the original response and cannot be retrieved again",
+    }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/rotate",
+    tags=["sessions"],
+    status_code=201,
+    dependencies=[Depends(require_api_key)],
+)
+def rotate_session(
+    session_id: str,
+    payload: RotateSessionRequest,
+    database: Database = Depends(db),
+    idempotency_key: str | None = Header(default=None),
+):
+    """Re-shard the key of an active session under a new (threshold, total).
+
+    The caller proves possession of the key by submitting at least the old
+    threshold of integrity-verified shares. In a single transaction the old
+    session is marked ``rotated`` (recovery permanently disabled) and the
+    replacement session is created; its shares are returned exactly once.
+    A failed rotation changes nothing.
+    """
+    if payload.new_total < payload.new_threshold:
+        raise error(
+            "invalid_parameters",
+            "new_total must be greater than or equal to new_threshold",
+            422,
+        )
+
+    idem = payload.idempotency_key or idempotency_key
+    shares_hash = hashlib.sha256(
+        "\n".join(payload.shares).encode("utf-8")
+    ).hexdigest()
+    request_hash = hashlib.sha256(
+        f"rotate|{session_id}|{payload.new_threshold}|{payload.new_total}"
+        f"|{shares_hash}".encode("ascii")
+    ).hexdigest()
+
+    # Idempotent replay: same key + same request -> metadata of the
+    # replacement session only; same key + different request -> conflict.
+    # (Re-checked inside the write transaction to close the race.)
+    if idem is not None:
+        existing = database.get_idempotency_record(idem)
+        if existing is not None:
+            if existing["request_hash"] != request_hash:
+                raise error(
+                    "idempotency_conflict",
+                    "idempotency key was already used with a different request",
+                    409,
+                )
+            new_row = database.get_session(existing["session_id"])
+            return _rotation_replay_response(session_id, new_row)
+
+    row = database.get_session(session_id)
+    if row is None:
+        raise error("session_not_found", "recovery session does not exist", 404)
+    if row["status"] == "revoked":
+        raise error("session_revoked", "session has been revoked", 409)
+    if row["status"] == "rotated":
+        raise error(
+            "session_rotated",
+            "session was already rotated",
+            409,
+            details={"replacement_session_id": row["replacement_session_id"]},
+        )
+    if row["status"] != "active":
+        raise error(
+            "session_not_rotatable",
+            f"a {row['status']} session cannot be rotated",
+            409,
+        )
+
+    # Every submitted share must pass integrity verification, and there must
+    # be at least the old threshold of them. Any failure here is checked
+    # before a single write, so the old session is left untouched.
+    valid, rejected = verify_share_tokens(
+        database, session_id, row, payload.shares
+    )
+    if rejected:
+        raise error(
+            "share_verification_failed",
+            "every submitted share must pass integrity verification; "
+            "rotation aborted and no state was changed",
+            400,
+            details={"rejected": rejected},
+        )
+    if len(valid) < row["threshold"]:
+        raise error(
+            "insufficient_shares",
+            "fewer verified shares than the current threshold; "
+            "rotation aborted and no state was changed",
+            400,
+            details={
+                "required": row["threshold"],
+                "provided": len(valid),
+            },
+        )
+
+    # All points are individually authenticated, so interpolation only ever
+    # runs on genuine shares of this session.
+    chosen = sorted(valid.items())[: row["threshold"]]
+    key = sharing.reconstruct_secret([(x, y) for x, y in chosen])
+    if not hmac.compare_digest(
+        hashlib.sha256(key).hexdigest(), row["key_digest"]
+    ):
+        # Defence in depth: cannot happen with t valid shares, but never
+        # rotate on a value whose checksum does not match.
+        raise error(
+            "rotation_verification_failed",
+            "reconstructed key failed checksum verification; "
+            "rotation aborted and no state was changed",
+            400,
+        )
+
+    new_session_id = uuid.uuid4().hex
+    # Split before the transaction so a failure here cannot touch state.
+    pairs = sharing.split_secret(key, payload.new_threshold, payload.new_total)
+    checksums = {x: share_digest(new_session_id, x, y) for x, y in pairs}
+
+    try:
+        stored_id, created_now = database.rotate_session(
+            session_id,
+            new_session_id,
+            threshold=payload.new_threshold,
+            total_shares=payload.new_total,
+            key_digest=row["key_digest"],
+            key_encoding=row["key_encoding"],
+            key_length=row["key_length"],
+            share_checksums=checksums,
+            idempotency_key=idem,
+            request_hash=request_hash,
+        )
+    except IdempotencyConflict:
+        raise error(
+            "idempotency_conflict",
+            "idempotency key was already used with a different request",
+            409,
+        )
+    except RotationStateError:
+        raise error(
+            "session_not_rotatable",
+            "session state changed concurrently; rotation aborted and no "
+            "state was changed",
+            409,
+        )
+
+    if not created_now:
+        # Concurrent request with the same idempotency key committed first.
+        new_row = database.get_session(stored_id)
+        return _rotation_replay_response(session_id, new_row)
+
+    tokens = [sharing.encode_share(new_session_id, x, y) for x, y in pairs]
+    return {
+        "old_session_id": session_id,
+        "old_status": "rotated",
+        "session_id": new_session_id,
+        "status": "active",
+        "threshold": payload.new_threshold,
+        "total_shares": payload.new_total,
+        "shares": tokens,
+        "share_checksums": [
+            {"index": x, "digest": checksums[x]} for x, _ in pairs
+        ],
+        "shares_returned": True,
+        "replay": False,
+        "message": "old session is now rotated and rejects all recovery; "
+        "store the new shares securely, they are shown only once",
     }

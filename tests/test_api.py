@@ -315,6 +315,455 @@ def _make_share(sid, x, y):
     return encode_share(sid, x, y)
 
 
+class TestRotation:
+    def rotate(self, client, sid, shares, new_t=2, new_n=4, **extra):
+        body = {"shares": shares, "new_threshold": new_t, "new_total": new_n}
+        body.update(extra)
+        return client.post(f"/api/v1/sessions/{sid}/rotate", json=body)
+
+    def test_rotate_success_flow(self, client):
+        secret = "rotate-me-🔑"
+        old = create(client, secret=secret, t=3, n=5)
+        old_id = old["session_id"]
+
+        r = self.rotate(client, old_id, old["shares"][:3], new_t=2, new_n=4)
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["old_session_id"] == old_id
+        assert body["old_status"] == "rotated"
+        assert body["status"] == "active"
+        assert body["threshold"] == 2 and body["total_shares"] == 4
+        assert body["shares_returned"] is True and body["replay"] is False
+        assert len(body["shares"]) == 4
+        new_id = body["session_id"]
+        assert new_id != old_id
+
+        # New shares are bound to the NEW session id.
+        from app.sharing import decode_share
+
+        for token in body["shares"]:
+            assert decode_share(token)[0] == new_id
+
+        # Old session is rotated and points at its replacement.
+        info = client.get(f"/api/v1/sessions/{old_id}").json()
+        assert info["status"] == "rotated"
+        assert info["replacement_session_id"] == new_id
+        assert info["rotated_at"] is not None
+
+        # New session reconstructs the SAME key with the NEW threshold.
+        r = client.post(
+            f"/api/v1/sessions/{new_id}/shares",
+            json={"shares": body["shares"][:2]},
+        )
+        assert r.json()["recovered"] is True
+        assert r.json()["key"] == secret
+
+    def test_rotated_old_session_rejects_recovery(self, client):
+        old = create(client, t=3, n=5)
+        old_id = old["session_id"]
+        new_id = self.rotate(client, old_id, old["shares"][:3]).json()[
+            "session_id"
+        ]
+
+        r = client.post(
+            f"/api/v1/sessions/{old_id}/shares",
+            json={"shares": old["shares"][:3]},
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "session_rotated"
+        assert err["details"]["replacement_session_id"] == new_id
+
+    def test_rotate_with_tampered_share_aborts_without_side_effects(
+        self, client
+    ):
+        old = create(client, secret="still-safe", t=3, n=5)
+        old_id = old["session_id"]
+        from app.sharing import decode_share, encode_share
+
+        sid, x, y = decode_share(old["shares"][0])
+        tampered = encode_share(sid, x, bytes([y[0] ^ 0xFF]) + y[1:])
+
+        r = self.rotate(client, old_id, [tampered] + old["shares"][1:3])
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "share_verification_failed"
+
+        # Failure must not change the old session nor create a new one.
+        info = client.get(f"/api/v1/sessions/{old_id}").json()
+        assert info["status"] == "active"
+        assert info["replacement_session_id"] is None
+        assert info["rotated_at"] is None
+        # Old session still fully functional afterwards.
+        r = client.post(
+            f"/api/v1/sessions/{old_id}/shares",
+            json={"shares": old["shares"][:3]},
+        )
+        assert r.json()["key"] == "still-safe"
+
+    def test_rotate_insufficient_shares_aborts(self, client):
+        old = create(client, t=3, n=5)
+        old_id = old["session_id"]
+        r = self.rotate(client, old_id, old["shares"][:2])
+        assert r.status_code == 400
+        err = r.json()["error"]
+        assert err["code"] == "insufficient_shares"
+        assert err["details"] == {"required": 3, "provided": 2}
+        assert client.get(f"/api/v1/sessions/{old_id}").json()["status"] == (
+            "active"
+        )
+
+    def test_rotate_idempotent_replay_returns_metadata_only(self, client):
+        old = create(client, t=3, n=5)
+        old_id = old["session_id"]
+        body = {
+            "shares": old["shares"][:3],
+            "new_threshold": 2,
+            "new_total": 4,
+            "idempotency_key": "rot-key-1",
+        }
+        r1 = client.post(f"/api/v1/sessions/{old_id}/rotate", json=body)
+        r2 = client.post(f"/api/v1/sessions/{old_id}/rotate", json=body)
+        assert r1.status_code == 201 and r2.status_code == 201
+        first, second = r1.json(), r2.json()
+        assert first["session_id"] == second["session_id"]
+        assert first["shares"] is not None
+        # Replay exposes metadata only, never the shares again.
+        assert second["shares"] is None
+        assert second["shares_returned"] is False
+        assert second["replay"] is True
+        assert second["old_session_id"] == old_id
+
+    def test_rotate_idempotency_key_via_header(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        body = {"shares": old["shares"][:2], "new_threshold": 2, "new_total": 3}
+        r1 = client.post(
+            f"/api/v1/sessions/{old_id}/rotate",
+            json=body,
+            headers={"Idempotency-Key": "rot-hdr-1"},
+        )
+        r2 = client.post(
+            f"/api/v1/sessions/{old_id}/rotate",
+            json=body,
+            headers={"Idempotency-Key": "rot-hdr-1"},
+        )
+        assert r1.json()["session_id"] == r2.json()["session_id"]
+        assert r2.json()["replay"] is True
+
+    def test_rotate_idempotency_conflict_on_different_request(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        body = {
+            "shares": old["shares"][:2],
+            "new_threshold": 2,
+            "new_total": 3,
+            "idempotency_key": "rot-key-2",
+        }
+        assert client.post(
+            f"/api/v1/sessions/{old_id}/rotate", json=body
+        ).status_code == 201
+        changed = {**body, "new_total": 5}
+        r = client.post(f"/api/v1/sessions/{old_id}/rotate", json=changed)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "idempotency_conflict"
+
+    def test_rotate_without_key_cannot_be_retried_after_success(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        r1 = self.rotate(client, old_id, old["shares"][:2])
+        assert r1.status_code == 201
+        # Same request again (no idempotency key): old session is terminal.
+        r2 = self.rotate(client, old_id, old["shares"][:2])
+        assert r2.status_code == 409
+        err = r2.json()["error"]
+        assert err["code"] == "session_rotated"
+        assert err["details"]["replacement_session_id"] == r1.json()[
+            "session_id"
+        ]
+
+    def test_rotate_revoked_session_rejected(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        client.post(f"/api/v1/sessions/{old_id}/revoke")
+        r = self.rotate(client, old_id, old["shares"][:2])
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_revoked"
+
+    def test_rotate_recovered_session_rejected(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        client.post(
+            f"/api/v1/sessions/{old_id}/shares",
+            json={"shares": old["shares"][:2]},
+        )
+        r = self.rotate(client, old_id, old["shares"][:2])
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_not_rotatable"
+
+    def test_rotated_session_cannot_be_revoked(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        self.rotate(client, old_id, old["shares"][:2])
+        r = client.post(f"/api/v1/sessions/{old_id}/revoke")
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_not_revocable"
+
+    def test_rotate_not_found(self, client):
+        r = self.rotate(client, "deadbeef", ["whatever"])
+        assert r.status_code == 404
+
+    def test_rotate_param_validation(self, client):
+        old = create(client, t=2, n=3)
+        old_id = old["session_id"]
+        r = self.rotate(client, old_id, old["shares"][:2], new_t=4, new_n=2)
+        assert r.status_code == 422
+        r = self.rotate(client, old_id, old["shares"][:2], new_t=1, new_n=2)
+        assert r.status_code == 422
+
+    def test_rotation_chain(self, client):
+        """A replacement session can itself be rotated again."""
+        first = create(client, secret="chain-key", t=2, n=3)
+        r1 = self.rotate(client, first["session_id"], first["shares"][:2])
+        second = r1.json()
+        r2 = self.rotate(client, second["session_id"], second["shares"][:2])
+        assert r2.status_code == 201, r2.text
+        third = r2.json()
+        r = client.post(
+            f"/api/v1/sessions/{third['session_id']}/shares",
+            json={"shares": third["shares"][:2]},
+        )
+        assert r.json()["key"] == "chain-key"
+        info = client.get(
+            f"/api/v1/sessions/{second['session_id']}"
+        ).json()
+        assert info["status"] == "rotated"
+        assert info["replacement_session_id"] == third["session_id"]
+
+
+class TestRotationDatabase:
+    def test_failed_rotation_leaves_no_trace(self, tmp_path):
+        """DB-level: a rotation that fails mid-transaction rolls back fully."""
+        from app.database import (
+            Database,
+            IdempotencyConflict,
+            RotationStateError,
+        )
+
+        db = Database(str(tmp_path / "rot.db"))
+        old_id, created = db.create_session(
+            "old1",
+            threshold=2,
+            total_shares=3,
+            key_digest="d",
+            key_encoding="utf-8",
+            key_length=1,
+            share_checksums={1: "a", 2: "b", 3: "c"},
+            idempotency_key=None,
+            request_hash="h0",
+        )
+        assert created is True
+
+        # Occupy an idempotency key with a different request hash.
+        db.create_session(
+            "other",
+            threshold=2,
+            total_shares=3,
+            key_digest="d",
+            key_encoding="utf-8",
+            key_length=1,
+            share_checksums={1: "a"},
+            idempotency_key="busy-key",
+            request_hash="hash-A",
+        )
+
+        # Rotation reusing the key with a different hash must fail atomically.
+        try:
+            db.rotate_session(
+                old_id,
+                "new1",
+                threshold=2,
+                total_shares=4,
+                key_digest="d",
+                key_encoding="utf-8",
+                key_length=1,
+                share_checksums={1: "x", 2: "y", 3: "z", 4: "w"},
+                idempotency_key="busy-key",
+                request_hash="hash-B",
+            )
+            raise AssertionError("expected IdempotencyConflict")
+        except IdempotencyConflict:
+            pass
+        assert db.get_session(old_id)["status"] == "active"
+        assert db.get_session("new1") is None
+
+        # Rotating a non-active session raises and writes nothing.
+        db.revoke_session(old_id)
+        try:
+            db.rotate_session(
+                old_id,
+                "new2",
+                threshold=2,
+                total_shares=4,
+                key_digest="d",
+                key_encoding="utf-8",
+                key_length=1,
+                share_checksums={1: "x", 2: "y", 3: "z", 4: "w"},
+                idempotency_key=None,
+                request_hash="h",
+            )
+            raise AssertionError("expected RotationStateError")
+        except RotationStateError:
+            pass
+        assert db.get_session(old_id)["status"] == "revoked"
+        assert db.get_session("new2") is None
+        db.close()
+
+    def test_successful_rotation_is_atomic_and_links_sessions(self, tmp_path):
+        from app.database import Database
+
+        db = Database(str(tmp_path / "rot2.db"))
+        db.create_session(
+            "old1",
+            threshold=3,
+            total_shares=5,
+            key_digest="kd",
+            key_encoding="hex",
+            key_length=8,
+            share_checksums={i: f"c{i}" for i in range(1, 6)},
+            idempotency_key=None,
+            request_hash="h0",
+        )
+        new_id, created = db.rotate_session(
+            "old1",
+            "new1",
+            threshold=2,
+            total_shares=4,
+            key_digest="kd",
+            key_encoding="hex",
+            key_length=8,
+            share_checksums={i: f"n{i}" for i in range(1, 5)},
+            idempotency_key="rk",
+            request_hash="rh",
+        )
+        assert (new_id, created) == ("new1", True)
+        old = db.get_session("old1")
+        assert old["status"] == "rotated"
+        assert old["replacement_session_id"] == "new1"
+        assert old["rotated_at"] is not None
+        new = db.get_session("new1")
+        assert new["status"] == "active"
+        assert new["threshold"] == 2 and new["total_shares"] == 4
+        assert new["key_digest"] == "kd"  # same key, re-sharded
+        assert db.get_share_digest("new1", 4) == "n4"
+
+        # Idempotent replay at the DB level returns the same replacement.
+        again = db.rotate_session(
+            "old1",
+            "new-ignored",
+            threshold=2,
+            total_shares=4,
+            key_digest="kd",
+            key_encoding="hex",
+            key_length=8,
+            share_checksums={1: "z"},
+            idempotency_key="rk",
+            request_hash="rh",
+        )
+        assert again == ("new1", False)
+        db.close()
+
+    def test_concurrent_rotations_single_winner(self, tmp_path):
+        """Racing rotations collapse to one; losers fail without side effects."""
+        import threading
+
+        from app.database import Database, RotationStateError
+
+        db = Database(str(tmp_path / "race.db"))
+        db.create_session(
+            "old",
+            threshold=2,
+            total_shares=3,
+            key_digest="d",
+            key_encoding="utf-8",
+            key_length=1,
+            share_checksums={1: "a", 2: "b", 3: "c"},
+            idempotency_key=None,
+            request_hash="h",
+        )
+        outcomes = []
+        barrier = threading.Barrier(8)
+
+        def worker(i):
+            barrier.wait()
+            try:
+                outcomes.append(
+                    db.rotate_session(
+                        "old",
+                        f"new{i}",
+                        threshold=2,
+                        total_shares=4,
+                        key_digest="d",
+                        key_encoding="utf-8",
+                        key_length=1,
+                        share_checksums={1: "x", 2: "y", 3: "z", 4: "w"},
+                        idempotency_key=None,
+                        request_hash="h",
+                    )
+                )
+            except RotationStateError:
+                outcomes.append("state-conflict")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        winners = [o for o in outcomes if o != "state-conflict"]
+        assert len(winners) == 1 and winners[0][1] is True
+        assert outcomes.count("state-conflict") == 7
+        old = db.get_session("old")
+        assert old["status"] == "rotated"
+        assert old["replacement_session_id"] == winners[0][0]
+        # Exactly one replacement session was persisted -- no orphans.
+        for i in range(8):
+            expected = 1 if f"new{i}" == winners[0][0] else 0
+            assert (db.get_session(f"new{i}") is not None) == bool(expected)
+        db.close()
+
+    def test_existing_database_is_migrated(self, tmp_path):
+        """A DB created with the pre-rotation schema gains the new columns."""
+        import sqlite3
+
+        path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, threshold INTEGER NOT NULL, "
+            "total_shares INTEGER NOT NULL, key_digest TEXT NOT NULL, "
+            "key_encoding TEXT NOT NULL, key_length INTEGER NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'active', recovered_at TEXT, "
+            "revoked_at TEXT, created_at TEXT NOT NULL, "
+            "recovery_attempts INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, threshold, total_shares, key_digest, "
+            "key_encoding, key_length, created_at) "
+            "VALUES ('legacy1', 2, 3, 'd', 'utf-8', 1, 'now')"
+        )
+        conn.commit()
+        conn.close()
+
+        from app.database import Database
+
+        db = Database(path)  # must not raise; adds rotated_at etc.
+        row = db.get_session("legacy1")
+        assert row["status"] == "active"
+        assert row["rotated_at"] is None
+        assert row["replacement_session_id"] is None
+        db.close()
+
+
 class TestApiKeyAuth:
     @pytest.fixture()
     def authed_client(self, tmp_path, monkeypatch):

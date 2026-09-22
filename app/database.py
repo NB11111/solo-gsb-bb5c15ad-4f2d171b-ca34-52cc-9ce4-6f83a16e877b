@@ -12,22 +12,25 @@ import hashlib
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id                  TEXT PRIMARY KEY,
-    threshold           INTEGER NOT NULL,
-    total_shares        INTEGER NOT NULL,
-    key_digest          TEXT NOT NULL,
-    key_encoding        TEXT NOT NULL,
-    key_length          INTEGER NOT NULL,
-    status              TEXT NOT NULL DEFAULT 'active',
-    recovered_at        TEXT,
-    revoked_at          TEXT,
-    created_at          TEXT NOT NULL,
-    recovery_attempts   INTEGER NOT NULL DEFAULT 0
+    id                      TEXT PRIMARY KEY,
+    threshold               INTEGER NOT NULL,
+    total_shares            INTEGER NOT NULL,
+    key_digest              TEXT NOT NULL,
+    key_encoding            TEXT NOT NULL,
+    key_length              INTEGER NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'active',
+    recovered_at            TEXT,
+    revoked_at              TEXT,
+    rotated_at              TEXT,
+    replacement_session_id  TEXT,
+    created_at              TEXT NOT NULL,
+    recovery_attempts       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS session_shares (
@@ -86,6 +89,41 @@ class Database:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to existing DBs."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(sessions)")
+        }
+        for column, ddl in (
+            ("rotated_at", "ALTER TABLE sessions ADD COLUMN rotated_at TEXT"),
+            (
+                "replacement_session_id",
+                "ALTER TABLE sessions ADD COLUMN replacement_session_id TEXT",
+            ),
+        ):
+            if column not in cols:
+                self._conn.execute(ddl)
+
+    @contextmanager
+    def _transaction(self):
+        """Explicit BEGIN IMMEDIATE/COMMIT/ROLLBACK around multiple writes.
+
+        The connection runs with isolation_level=None (autocommit), so the
+        ``with conn:`` context manager alone would NOT roll back earlier
+        statements -- each one would commit on its own. Real atomicity for
+        multi-statement writes therefore needs an explicit transaction.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
 
     def close(self) -> None:
         with self._lock:
@@ -111,7 +149,7 @@ class Database:
         With an idempotency key a repeated request returns the original
         session id with created_now=False (shares must not be re-returned).
         """
-        with self._lock, self._conn:  # implicit BEGIN/COMMIT
+        with self._lock, self._transaction():
             if idempotency_key is not None:
                 row = self._conn.execute(
                     "SELECT session_id, request_hash FROM idempotency "
@@ -158,6 +196,91 @@ class Database:
             return self._conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
+
+    def get_idempotency_record(self, idempotency_key: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT session_id, request_hash FROM idempotency "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+
+    def rotate_session(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        *,
+        threshold: int,
+        total_shares: int,
+        key_digest: str,
+        key_encoding: str,
+        key_length: int,
+        share_checksums: dict[int, str],
+        idempotency_key: str | None,
+        request_hash: str,
+    ) -> tuple[str, bool]:
+        """Atomically create the replacement session and rotate the old one.
+
+        Single transaction: mark ``old_session_id`` rotated (only if still
+        active), insert the new session with its share checksums, and record
+        the idempotency key. Any failure rolls everything back, so a failed
+        rotation never changes the old session nor leaves a new one behind.
+
+        Returns (new_session_id, created_now); with a replayed idempotency
+        key returns the previously created replacement id and False.
+        """
+        with self._lock, self._transaction():
+            if idempotency_key is not None:
+                row = self._conn.execute(
+                    "SELECT session_id, request_hash FROM idempotency "
+                    "WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row is not None:
+                    if row["request_hash"] != request_hash:
+                        raise IdempotencyConflict()
+                    return row["session_id"], False
+
+            cur = self._conn.execute(
+                "UPDATE sessions SET status = 'rotated', rotated_at = ?, "
+                "replacement_session_id = ? "
+                "WHERE id = ? AND status = 'active'",
+                (utcnow(), new_session_id, old_session_id),
+            )
+            if cur.rowcount != 1:
+                # Concurrent recovery/revoke/rotation won the race; abort so
+                # the caller can re-read the state. Nothing was written.
+                raise RotationStateError()
+
+            self._conn.execute(
+                "INSERT INTO sessions (id, threshold, total_shares, key_digest, "
+                "key_encoding, key_length, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
+                (
+                    new_session_id,
+                    threshold,
+                    total_shares,
+                    key_digest,
+                    key_encoding,
+                    key_length,
+                    utcnow(),
+                ),
+            )
+            self._conn.executemany(
+                "INSERT INTO session_shares (session_id, share_index, digest) "
+                "VALUES (?, ?, ?)",
+                [
+                    (new_session_id, idx, digest)
+                    for idx, digest in sorted(share_checksums.items())
+                ],
+            )
+            if idempotency_key is not None:
+                self._conn.execute(
+                    "INSERT INTO idempotency (idempotency_key, session_id, "
+                    "request_hash, created_at) VALUES (?, ?, ?, ?)",
+                    (idempotency_key, new_session_id, request_hash, utcnow()),
+                )
+        return new_session_id, True
 
     def get_share_digest(self, session_id: str, x: int) -> str | None:
         with self._lock:
@@ -214,6 +337,10 @@ class Database:
 
 class IdempotencyConflict(Exception):
     """An idempotency key was reused with a different request payload."""
+
+
+class RotationStateError(Exception):
+    """The old session left the active state while rotation was committing."""
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
